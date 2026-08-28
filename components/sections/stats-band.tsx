@@ -2,6 +2,14 @@
 
 import { motion, useReducedMotion } from "framer-motion";
 
+/**
+ * Stats Band Section - Horizontal metrics display
+ * 
+ * Features:
+ * - Staggered fade-in animations for each stat
+ * - Responsive grid layout (2x2 on mobile, 4-across on desktop)
+ * - Clean typography hierarchy with uppercase labels
+ */
 export function StatsBand({
   stats
 }: {
