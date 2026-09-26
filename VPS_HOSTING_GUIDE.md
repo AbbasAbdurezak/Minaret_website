@@ -1,264 +1,144 @@
-# Minaret Next.js Web Application - VPS Hosting & Security Hardening Guide
+# VPS Hosting Guide & Service Inventory
 
-This document details step-by-step instructions for deploying the hardened Next.js web application to a Ubuntu Linux VPS. It covers host-level settings, firewalls, permissions, systemd configuration, Nginx setup, TLS, and automatic backups.
+**Server IP**: `62.171.182.92`  
+**Host Name**: `vmi3192470`  
+**SSH Access**: `ssh root@62.171.182.92`  
+**Base Project Directory**: `/opt/`  
+**Primary Reverse Proxy**: Nginx (`systemd` service: `nginx.service`)  
 
 ---
 
-## 1. System Users & Directory Permissions
+## 1. Master Service & Port Inventory
 
-To prevent security compromises from propagating, the Node.js process MUST run as a dedicated, low-privilege service user (`minaret`) instead of `root`.
+Before adding any new service, check this table to ensure you do not collide with existing host ports.
 
-### Create the Service User & Group
+| Project Name | Path on VPS | Domain / Host URL | Host Ports (Bound) | Internal Ports | Technology / Compose |
+|---|---|---|---|---|---|
+| **Property Management (PMS)** | `/opt/property-management` | `property.minaretrealstate.com` | `127.0.0.1:3456` (Web)<br>`127.0.0.1:8090` (Gateway API) | `auth:5001`<br>`billing:5004`<br>`admin:5005`<br>`notify:5006`<br>`prop:5011` | Docker Compose (Next.js 16 + .NET 8 Microservices + 4x Postgres + Redis) |
+| **Pharmacy Web App** | `/opt/pharmacy-webapp` | Configured in Nginx | `127.0.0.1:3000` (Web)<br>`127.0.0.1:8080` (API) | `5432` (DB)<br>`6379` (Redis)<br>`6432` (PgBouncer) | Docker Compose |
+| **Pharmacy Capacity Test** | `/opt/pharmacy-webapp/load-tests` | Internal test | `127.0.0.1:18081` (API) | `5432` (DB)<br>`6379` (Redis) | Docker Compose (`compose.capacity.yml`) |
+| **Seafile Cloud Storage** | `/opt/seafile` | Configured in Nginx | `127.0.0.1:8088` (Web) | `3306` (MySQL)<br>`6379` (Redis) | Docker Compose (`seafile-server.yml`) |
+| **EnjazAssist** | `/opt/EnjazAssist` | Port 89 direct | `0.0.0.0:89` (Web) | `8080` (API)<br>`5432` (DB) | Docker Compose |
+| **Minaret Website** | `/opt/minaret-website` | `minaretrealstate.com` | `127.0.0.1:3460` (Web) | `3000` | Docker Compose (Next.js 15) |
+| **System Services** | OS Level | All interfaces | `22` (SSH)<br>`80` (HTTP)<br>`443` (HTTPS)<br>`8443` (Alt HTTPS)<br>`53` (DNS resolver) | — | OpenSSH, Nginx, systemd-resolved |
+
+---
+
+## 2. The 3 VPS Checks (Run Before Hosting ANY New Project)
+
+Whenever you are about to host a new project on this VPS, run these 3 checks:
+
+### Check 1: Find Active & Free Host Ports
+Run this command to check every port currently listening on the server:
 ```bash
-# Create a system group
-sudo groupadd -r minaret
-
-# Create a system user with shell access disabled
-sudo useradd -r -g minaret -d /srv/minaret -s /sbin/nologin minaret
+sudo ss -tulpn | grep LISTEN
 ```
+* **What to look for**: Check the `Local Address:Port` column (e.g., `127.0.0.1:8080`, `0.0.0.0:89`).
+* **Rule**: Pick a port number not listed in this output (e.g., in the `3000–3999` range for frontends or `8000–8999` for APIs).
 
-### Setup Directory Structure & Ownership
-Store the application releases in `/srv/minaret`. Shared folders (for uploaded files and dynamic JSON content) should be kept outside the active release directory to allow atomic releases.
+---
+
+### Check 2: Audit Running Docker Stacks & Containers
+Run these two commands to inspect all active Docker projects and their published ports:
 ```bash
-# Create directory structure
-sudo mkdir -p /srv/minaret/releases
-sudo mkdir -p /srv/minaret/shared/data
-sudo mkdir -p /srv/minaret/shared/uploads
+# List all active Docker Compose project stacks
+docker compose ls
 
-# Ensure permissions on shared directories
-sudo chown -R minaret:minaret /srv/minaret/shared
-sudo chmod 750 /srv/minaret/shared
-sudo chmod 700 /srv/minaret/shared/data
-sudo chmod 750 /srv/minaret/shared/uploads
+# List every running container with its mapped ports
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 ```
+* **What to look for**:
+  1. The `CONFIG FILES` column shows the directory where the project's compose file lives (under `/opt/`).
+  2. The `PORTS` column shows if a container is binding `127.0.0.1:<PORT>` or `0.0.0.0:<PORT>`.
+* **Rule**: Never use a container name or host port that already exists.
 
 ---
 
-## 2. Environment Variables & Secrets Management
-
-Secrets must be kept outside the application repository. Store them in a secure root-owned environment file.
-
-1. Create the configuration directory:
-   ```bash
-   sudo mkdir -p /etc/minaret
-   sudo touch /etc/minaret/minaret.env
-   ```
-2. Populate `/etc/minaret/minaret.env` with your production variables:
-   ```env
-   NODE_ENV=production
-   ADMIN_USERNAME=minaret_admin
-   ADMIN_PASSWORD_HASH=scrypt:your-salt:your-hash
-   ADMIN_SESSION_SECRET=your-secure-random-bytes-hex
-   ADMIN_COOKIE_SECURE=true
-   ```
-3. Lock down file access:
-   ```bash
-   # Restrict read/write permissions to root only, allowing group read to minaret
-   sudo chown root:minaret /etc/minaret/minaret.env
-   sudo chmod 640 /etc/minaret/minaret.env
-   ```
-
----
-
-## 3. systemd Service Configuration
-
-Create a systemd unit file at `/etc/systemd/system/minaret.service` to manage the process, auto-restart on failures, and restrict system capabilities.
-
-### Unit File Definition (`/etc/systemd/system/minaret.service`)
-```ini
-[Unit]
-Description=Minaret Next.js Web Application
-After=network.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=minaret
-Group=minaret
-WorkingDirectory=/srv/minaret/current
-Environment=NODE_ENV=production
-EnvironmentFile=/etc/minaret/minaret.env
-ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1 --port 3000
-
-# Auto-restart on crashes
-Restart=on-failure
-RestartSec=5
-TimeoutStartSec=60
-TimeoutStopSec=30
-KillSignal=SIGTERM
-
-# Hardening System Isolation
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-CapabilityBoundingSet=
-UMask=0077
-
-# Grant access only to specific writable paths
-ReadWritePaths=/srv/minaret/shared/data
-ReadWritePaths=/srv/minaret/shared/uploads
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Enable & Start Service
+### Check 3: Check Nginx Reverse Proxy Configs & Domains
+Check which domains are already configured and where they are forwarding traffic:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable minaret
-sudo systemctl start minaret
-
-# Check status
-sudo systemctl status minaret
+# Print all configured server names and their proxy targets
+sudo nginx -T 2>/dev/null | grep -E "server_name|listen|proxy_pass"
 ```
+Or list existing Nginx site configuration files:
+```bash
+ls -la /etc/nginx/sites-enabled/
+```
+* **What to look for**:
+  1. Make sure your new domain/subdomain isn't already used in another `.conf` file.
+  2. Confirm which internal port (`127.0.0.1:XXXX`) each existing site routes to.
 
 ---
 
-## 4. Firewall Settings (UFW)
+## 3. All-in-One 1-Second Audit Script
 
-Lock down ports using the Uncomplicated Firewall (UFW). Node.js (port 3000) should ONLY listen on `127.0.0.1` and never be publicly exposed.
+You can copy and paste this single command block into your VPS SSH terminal anytime to get an instant audit report:
 
 ```bash
-# Block all incoming traffic by default, allow outgoing
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
+echo "==================== [1] ACTIVE LISTENING PORTS ===================="
+sudo ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}' | column -t
 
-# Allow necessary public services
-sudo ufw allow OpenSSH
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
+echo -e "\n==================== [2] ACTIVE DOCKER STACKS ======================"
+docker compose ls 2>/dev/null || echo "No compose stacks found."
 
-# Enable firewall
-sudo ufw enable
+echo -e "\n==================== [3] DOCKER CONTAINERS & PORTS ================="
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-# Verify status
-sudo ufw status verbose
+echo -e "\n==================== [4] NGINX DOMAINS & PROXIES ==================="
+sudo nginx -T 2>/dev/null | grep -E "server_name|proxy_pass" | grep -v "#" | sed 's/^[ \t]*//' | sort -u
+echo "===================================================================="
 ```
 
 ---
 
-## 5. SSH Configuration Hardening
+## 4. Standard 6-Step Workflow to Deploy Any New Project
 
-Update `/etc/ssh/sshd_config` to mitigate SSH brute force and login attacks.
+Follow this exact process to deploy future projects cleanly:
 
-1. Open SSH configuration:
-   ```bash
-   sudo nano /etc/ssh/sshd_config
-   ```
-2. Apply the following options:
-   ```text
-   # Disable root login
-   PermitRootLogin no
+### Step 1: Run the 3 Checks & Choose Free Ports
+Run the audit script above. Pick free host ports (e.g., `WEB_PORT=3460`, `API_PORT=8095`).
 
-   # Disable password authentication (use SSH keys instead)
-   PasswordAuthentication no
-   PubkeyAuthentication yes
-
-   # Limit max authentication attempts
-   MaxAuthTries 3
-
-   # Enable SSH Protocol 2
-   Protocol 2
-   ```
-3. Restart SSH daemon:
-   ```bash
-   sudo systemctl restart sshd
-   ```
-
----
-
-## 6. Nginx Reverse Proxy Configuration
-
-Install Nginx to act as the web server, proxy requests to Next.js on port 3000, enforce TLS, add HTTP security headers, and throttle login/contact API paths.
-
-### Install Nginx
+### Step 2: Set Up Directory Under `/opt/`
 ```bash
-sudo apt update
-sudo apt install nginx -y
+cd /opt
+git clone <YOUR_REPO_URL> <project-name>
+cd /opt/<project-name>
 ```
 
-### Server Configuration File (`/etc/nginx/sites-available/minaret`)
-Create the configuration file:
+### Step 3: Configure `.env`
+Set the chosen free ports and production secrets in `.env`:
+```bash
+nano .env
+```
+*(Ensure all database passwords, JWT keys, and host port bindings use your chosen values)*.
+
+### Step 4: Add DNS `A` Record
+At your domain registrar / Cloudflare:
+* **Type**: `A`
+* **Name**: `<subdomain>`
+* **Points to**: `62.171.182.92`
+* **TTL**: Auto / 5 min
+
+Verify resolution from your VPS:
+```bash
+ping <subdomain>.yourdomain.com
+```
+
+### Step 5: Create Nginx Site Configuration
+Create `/etc/nginx/sites-available/<subdomain>.yourdomain.com.conf`:
 ```nginx
-# Rate limiting zones
-limit_req_zone $binary_remote_addr zone=admin_login:10m rate=5r/m;
-limit_req_zone $binary_remote_addr zone=contact_submit:10m rate=3r/m;
-
-# HTTP Redirect to HTTPS
 server {
     listen 80;
-    listen [::]:80;
-    server_name minaretrealstate.com www.minaretrealstate.com;
+    server_name <subdomain>.yourdomain.com;
+    client_max_body_size 30M;
 
-    return 301 https://minaretrealstate.com$request_uri;
-}
-
-# HTTPS Server Block
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name minaretrealstate.com;
-
-    # SSL parameters (will be managed by Certbot, baseline recommendations below)
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
-
-    # Dynamic Upload size limits
-    client_max_body_size 10m;
-
-    # Security Headers
-    server_tokens off;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options "DENY" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
-    
-    # CSP Baseline Report-Only Mode (Adjust script/style nonces as necessary)
-    add_header Content-Security-Policy-Report-Only "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests" always;
-
-    # Static uploads security configuration
-    location ^~ /uploads/ {
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header Content-Security-Policy "default-src 'none'; img-src 'self'" always;
-        alias /srv/minaret/shared/uploads/;
-        try_files $uri =404;
-    }
-
-    # Throttled Admin Login API
-    location = /api/admin/login {
-        limit_req zone=admin_login burst=5 nodelay;
-        proxy_pass http://127.0.0.1:3000;
-        
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # Throttled Contact Submission API
-    location = /api/contact {
-        limit_req zone=contact_submit burst=3 nodelay;
-        proxy_pass http://127.0.0.1:3000;
-        
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # Default Next.js App Proxy
     location / {
-        proxy_pass http://127.0.0.1:3000;
-        
+        proxy_pass http://127.0.0.1:<CHOSEN_PORT>;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
         proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -266,91 +146,17 @@ server {
 }
 ```
 
-Enable the configuration link and restart Nginx:
+Enable site, test Nginx, and issue SSL:
 ```bash
-sudo ln -s /etc/nginx/sites-available/minaret /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/<subdomain>.yourdomain.com.conf /etc/nginx/sites-enabled/
 sudo nginx -t
-sudo systemctl restart nginx
+sudo systemctl reload nginx
+sudo certbot --nginx -d <subdomain>.yourdomain.com
 ```
 
----
-
-## 7. Let's Encrypt TLS Certificate Setup
-
-Generate free, automatically renewing certificates using Certbot.
-
+### Step 6: Start Containers & Update This Registry
 ```bash
-# Install Certbot
-sudo apt install certbot python3-certbot-nginx -y
-
-# Generate and configure SSL inside Nginx automatically
-sudo certbot --nginx -d minaretrealstate.com
+docker compose up -d --build
+docker compose ps
 ```
-
-Confirm automatic renewal is enabled:
-```bash
-sudo systemctl status certbot.timer
-```
-
----
-
-## 8. Backup & Logging Strategy
-
-### Automatic Backups
-Dynamic contents (`/srv/minaret/shared/data/content.json` and contact submissions `/srv/minaret/shared/data/messages.json`) as well as uploads should be backed up nightly.
-
-Create a root script `/usr/local/bin/minaret-backup.sh`:
-```bash
-#!/bin/bash
-BACKUP_DIR="/var/backups/minaret"
-DATE=$(date +\%F)
-
-mkdir -p "$BACKUP_DIR"
-tar -czf "$BACKUP_DIR/minaret-shared-backup-$DATE.tar.gz" -C /srv/minaret/shared .
-
-# Keep only the last 30 backups
-find "$BACKUP_DIR" -name "minaret-shared-backup-*" -mtime +30 -exec rm {} \;
-```
-Make it executable and assign a daily cron entry:
-```bash
-sudo chmod 700 /usr/local/bin/minaret-backup.sh
-# Add to crontab via: sudo crontab -e
-# 0 2 * * * /usr/local/bin/minaret-backup.sh
-```
-
----
-
-## 9. Deployment Script Baseline
-
-An automated git-based deployment script reduces errors during updates. Ensure your active build commands are executed safely:
-
-```bash
-#!/bin/bash
-set -e
-
-# Target directory definitions
-RELEASE_DIR="/srv/minaret/releases/$(date +%Y%m%d%H%M%S)"
-SHARED_DIR="/srv/minaret/shared"
-CURRENT_LINK="/srv/minaret/current"
-
-# 1. Clone/checkout code into release directory
-git clone git@github.com:your-user/minaret-website.git "$RELEASE_DIR"
-
-# 2. Install dependencies & build
-cd "$RELEASE_DIR"
-npm install --omit=dev
-npm run build
-
-# 3. Symlink shared directories (data & uploads)
-rm -rf "$RELEASE_DIR/data"
-ln -s "$SHARED_DIR/data" "$RELEASE_DIR/data"
-
-rm -rf "$RELEASE_DIR/public/uploads"
-ln -s "$SHARED_DIR/uploads" "$RELEASE_DIR/public/uploads"
-
-# 4. Atomic symlink replacement to deploy
-ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
-
-# 5. Restart application daemon
-sudo systemctl restart minaret
-```
+Finally, add the new project's name and ports to the **Master Service & Port Inventory** table at the top of this document!

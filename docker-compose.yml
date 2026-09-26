@@ -1,0 +1,14 @@
+services:
+  minaret-website:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: minaret-website
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${HOST_PORT:-3460}:3000"
+    volumes:
+      - ./data:/app/data
+      - ./public/uploads:/app/public/uploads
